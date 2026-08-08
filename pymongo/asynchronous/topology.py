@@ -130,6 +130,11 @@ class Topology:
         )
 
         self._description = topology_description
+        # (description, selector, server) from the last single-candidate
+        # selection; see _select_server for why identity is enough.
+        self._selected_server: Optional[
+            tuple[TopologyDescription, Callable[[Selection], Selection], Server]
+        ] = None
         initial_td = TopologyDescription(
             TOPOLOGY_TYPE.Unknown, {}, None, None, None, self._settings
         )
@@ -340,6 +345,39 @@ class Topology:
         deprioritized_servers: Optional[list[Server]] = None,
         operation_id: Optional[int] = None,
     ) -> Server:
+        # An unchanged topology selects the same server, so remember the last
+        # answer and skip the lock, the selector and the description scan while
+        # it still applies.  Three properties make that sound:
+        #
+        #   * TopologyDescription is replaced, never mutated, whenever the
+        #     topology changes, so identity is a sufficient staleness check.
+        #     (_candidate_servers is per-selection scratch, and with no
+        #     deprioritized servers it is recomputed to the same list.)
+        #   * A Server is created once per address and lives as long as its
+        #     address is in the description, so a remembered Server cannot go
+        #     stale while the description it came with is current.
+        #   * Reading _description without the lock reads one immutable object.
+        #     A description installed after the read would have been installed
+        #     after the lock was released anyway.
+        #
+        # Only a single candidate is remembered: with several, selection
+        # load-balances on pool.operation_count and has to run every time.
+        #
+        # Skipping the scan also skips the selection STARTED message that
+        # _select_servers_loop emits, so the shortcut is off whenever server
+        # selection logging is on. Measured without it, the STARTED message
+        # goes missing for every operation after the first.
+        cacheable = (
+            address is None
+            and not deprioritized_servers
+            and not _is_debug_enabled(_SERVER_SELECTION_LOGGER)
+        )
+        if cacheable:
+            cached = self._selected_server
+            if cached is not None and cached[0] is self._description and cached[1] is selector:
+                return cached[2]
+            description = self._description
+
         servers = await self.select_servers(
             selector,
             operation,
@@ -349,7 +387,13 @@ class Topology:
             deprioritized_servers,
         )
         if len(servers) == 1:
-            return servers[0]
+            server = servers[0]
+            # Only remember it if the description held still throughout, so the
+            # entry cannot key a selection to a description it was not made
+            # against.
+            if cacheable and self._description is description:
+                self._selected_server = (description, selector, server)
+            return server
         server1, server2 = random.sample(servers, 2)
         if server1.pool.operation_count <= server2.pool.operation_count:
             return server1
