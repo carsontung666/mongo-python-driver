@@ -6,6 +6,8 @@ Changes in Version 4.18.0 (2026/XX/XX)
 
 PyMongo 4.18 brings a number of changes including:
 
+- Reduced connection pool locking overhead by taking the pool's internal mutex
+  once per checkout and once per checkin on the uncontended path.
 - Improved TLS connection performance by reusing TLS sessions across connections
   to the same server, avoiding a full handshake on each new connection.
   Session resumption is supported on all Python versions for synchronous clients

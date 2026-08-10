@@ -29,11 +29,11 @@ from unittest.mock import patch
 
 from bson.codec_options import DEFAULT_CODEC_OPTIONS
 from bson.son import SON
-from pymongo import AsyncMongoClient, message, timeout
+from pymongo import AsyncMongoClient, message, monitoring, timeout
 from pymongo.errors import AutoReconnect, ConnectionFailure, DuplicateKeyError
 from pymongo.hello import HelloCompat
 from pymongo.lock import _async_create_lock
-from pymongo.monitoring import _EventListeners
+from pymongo.monitoring import ConnectionClosedReason, _EventListeners
 from test.asynchronous.utils import async_get_pool, async_joinall, flaky
 
 sys.path[0:0] = [""]
@@ -276,6 +276,174 @@ class TestPooling(_TestPoolingBase):
         # Bookkeeping must be rolled back, not left half-updated.
         self.assertEqual(0, cx_pool.active_sockets)
         self.assertEqual(0, cx_pool.requests)
+
+    async def test_get_conn_rolls_back_on_cancel_without_the_fast_path(self):
+        # The same contract as the test above, but with _checkout_idle made to
+        # decline so _get_conn's own except clause is the thing exercised. A
+        # check-interval of 0 is the cheapest way to make it decline while
+        # still leaving a reusable connection in the queue.
+        cx_pool = await self.create_pool(max_pool_size=1)
+
+        async with cx_pool.checkout() as conn:
+            pass
+        cx_pool._check_interval_seconds = 0
+        self.assertIsNone(await cx_pool._checkout_idle(), "fast path should decline")
+        reused_context = conn.cancel_context
+
+        class _CancelOnReusedContext(set):
+            def add(self, item):
+                if item is reused_context:
+                    raise asyncio.CancelledError()
+                super().add(item)
+
+        cx_pool.active_contexts = _CancelOnReusedContext(cx_pool.active_contexts)
+
+        with self.assertRaises(asyncio.CancelledError):
+            async with cx_pool.checkout():
+                pass
+
+        self.assertEqual(0, cx_pool.active_sockets)
+        self.assertEqual(0, cx_pool.requests)
+
+    async def test_checkout_idle_declines_and_leaves_the_pool_untouched(self):
+        # Every branch on which _checkout_idle gives up must leave the pool
+        # exactly as it found it, or the long path that follows starts from
+        # bad accounting.
+        cx_pool = await self.create_pool(max_pool_size=1)
+        async with cx_pool.checkout():
+            pass
+        self.assertEqual(1, len(cx_pool.conns))
+
+        def snapshot():
+            return (
+                len(cx_pool.conns),
+                cx_pool.requests,
+                cx_pool.active_sockets,
+                cx_pool.operation_count,
+                len(cx_pool.active_contexts),
+            )
+
+        before = snapshot()
+
+        async def assert_declines(reason):
+            self.assertIsNone(await cx_pool._checkout_idle(), reason)
+            self.assertEqual(before, snapshot(), f"{reason} disturbed the pool")
+
+        # A connection idle long enough that _perished would ask the socket.
+        cx_pool._check_interval_seconds = 0
+        await assert_declines("check interval reached")
+        cx_pool._check_interval_seconds = 1
+
+        # Idle past maxIdleTimeMS. PoolOptions uses __slots__, so the private
+        # slot is set directly rather than rebuilding the pool.
+        cx_pool.opts._PoolOptions__max_idle_time_seconds = 0.0
+        try:
+            await assert_declines("idle past maxIdleTimeMS")
+        finally:
+            cx_pool.opts._PoolOptions__max_idle_time_seconds = None
+
+        # A stale generation. No service ids are in play, so the overall
+        # generation is the whole of it.
+        cx_pool.gen.inc(None)
+        try:
+            await assert_declines("stale generation")
+        finally:
+            cx_pool.gen._generation -= 1
+
+        # Nothing idle to hand out.
+        idle = cx_pool.conns.popleft()
+        empty_before = snapshot()
+        self.assertIsNone(await cx_pool._checkout_idle(), "no idle connection")
+        self.assertEqual(empty_before, snapshot(), "empty-queue decline disturbed the pool")
+        cx_pool.conns.appendleft(idle)
+
+        # Pool not ready.
+        await cx_pool.reset()
+        reset_before = snapshot()
+        self.assertIsNone(await cx_pool._checkout_idle(), "pool is not ready")
+        self.assertEqual(reset_before, snapshot(), "not-ready decline disturbed the pool")
+
+    async def test_checkout_idle_declines_when_requests_at_max(self):
+        # Upstream checkin's long path queues the connection in one critical
+        # section and releases the maxPoolSize slot in a later one; a fast
+        # checkout landing between the two sees a non-empty queue with
+        # requests == maxPoolSize and must decline, or the pool over-admits.
+        cx_pool = await self.create_pool(max_pool_size=1)
+        async with cx_pool.checkout():
+            pass
+        conn = await cx_pool._get_conn(0.0)  # requests == 1, queue empty
+        async with cx_pool.size_cond:
+            cx_pool.conns.appendleft(conn)  # the long checkin's first half
+        try:
+            self.assertIsNone(await cx_pool._checkout_idle())
+            self.assertEqual(1, len(cx_pool.conns))
+            self.assertEqual(1, cx_pool.requests)
+        finally:
+            async with cx_pool.size_cond:
+                cx_pool.conns.remove(conn)
+            await cx_pool.checkin(conn)
+        self.assertEqual(0, cx_pool.requests)
+
+    async def test_checkout_idle_failure_pairs_the_checkout_started_event(self):
+        # With CMAP events on, a raise inside _checkout_idle must emit
+        # ConnectionCheckOutFailedEvent so the started event is never left
+        # unpaired, and must not emit ConnectionCheckedOutEvent.
+        listener = CMAPListener()
+        cx_pool = await self.create_pool(
+            max_pool_size=1, event_listeners=_EventListeners([listener])
+        )
+        async with cx_pool.checkout():
+            pass
+        target = cx_pool.conns[0].cancel_context
+
+        class _CancelOnTarget(set):
+            def add(self, item):
+                if item is target:
+                    raise asyncio.CancelledError()
+                super().add(item)
+
+        cx_pool.active_contexts = _CancelOnTarget(cx_pool.active_contexts)
+        listener.reset()
+        with self.assertRaises(asyncio.CancelledError):
+            async with cx_pool.checkout():
+                pass
+        self.assertEqual(1, listener.event_count(monitoring.ConnectionCheckOutStartedEvent))
+        self.assertEqual(1, listener.event_count(monitoring.ConnectionCheckOutFailedEvent))
+        self.assertEqual(0, listener.event_count(monitoring.ConnectionCheckedOutEvent))
+        # And the pool is intact.
+        self.assertEqual(0, cx_pool.requests)
+        self.assertEqual(1, len(cx_pool.conns))
+
+    async def test_checkin_closes_stale_connection_before_releasing_the_slot(self):
+        # Releasing the maxPoolSize slot first would let a waiting thread open
+        # a replacement while the stale socket is still open, so the process
+        # would briefly hold twice maxPoolSize sockets.
+        cx_pool = await self.create_pool(max_pool_size=1)
+        conn = await cx_pool._get_conn(0.0)
+        self.assertEqual(1, cx_pool.requests)
+
+        # Make it stale, and record the accounting as it stood when the socket
+        # was closed.
+        cx_pool.gen.inc(None)
+        seen = {}
+        original_close = conn.close_conn
+
+        async def recording_close(reason):
+            seen["requests"] = cx_pool.requests
+            seen["active_sockets"] = cx_pool.active_sockets
+            seen["reason"] = reason
+            return await original_close(reason)
+
+        conn.close_conn = recording_close
+        await cx_pool.checkin(conn)
+
+        self.assertEqual(ConnectionClosedReason.STALE, seen.get("reason"))
+        self.assertEqual(1, seen["requests"], "slot released before the close")
+        self.assertEqual(1, seen["active_sockets"], "slot released before the close")
+        # And released afterwards.
+        self.assertEqual(0, cx_pool.requests)
+        self.assertEqual(0, cx_pool.active_sockets)
+        self.assertEqual(0, len(cx_pool.conns))
 
     async def test_pool_removes_closed_socket(self):
         # Test that Pool removes explicitly closed socket.

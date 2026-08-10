@@ -59,7 +59,6 @@ from pymongo.lock import (
     _create_condition,
     _create_lock,
 )
-from pymongo.logger import _CONNECTION_LOGGER, _is_debug_enabled
 from pymongo.monitoring import (
     ConnectionCheckOutFailedReason,
     ConnectionClosedReason,
@@ -984,6 +983,66 @@ class Pool:
                 self.address, AutoReconnect("connection pool paused"), timeout_details=details
             )
 
+    def _checkout_idle(self) -> Optional[Connection]:
+        """Check out an idle connection when nothing about the pool can block.
+
+        Pool.lock, size_cond and _max_connecting_cond are Condition views over
+        one mutex, so the five acquisitions the full path makes here collapse
+        into one without changing what is mutually excluded. Returns None --
+        and _get_conn runs in full -- whenever the pool is not READY, the
+        queue is empty, requests is at maxPoolSize, or the connection cannot
+        be proven usable without touching its socket.
+        """
+        with self.lock:
+            if (
+                self.state != PoolState.READY  # covers paused and closed
+                or not self.conns
+                or self.requests >= self.max_pool_size
+            ):
+                return None
+            conn = self.conns[0]
+            # _perished's checks, minus the one in the middle: conn_closed() is
+            # a syscall on the connection and does not belong under the pool
+            # mutex, so a connection idle long enough to need it goes the long
+            # way round. Any check added to _perished has to be added here too.
+            idle_time_seconds = conn.idle_time_seconds()
+            max_idle = self.opts.max_idle_time_seconds
+            if (
+                (max_idle is not None and idle_time_seconds > max_idle)
+                or self._needs_conn_closed_check(idle_time_seconds)
+                or self.stale_generation(conn.generation, conn.service_id)
+            ):
+                return None
+            # A KeyboardInterrupt or MemoryError can land between any two
+            # statements (no here, so not cancellation), so every
+            # mutation is inside the try and the rollback undoes exactly as
+            # far as `progress` records; the connection goes back unclosed.
+            progress = 0
+            try:
+                self.conns.popleft()
+                progress = 1
+                self.operation_count += 1
+                progress = 2
+                self.requests += 1
+                progress = 3
+                self.active_sockets += 1
+                progress = 4
+                conn.active = True
+                self.active_contexts.add(conn.cancel_context)
+                return conn
+            except BaseException:
+                self.active_contexts.discard(conn.cancel_context)
+                conn.active = False
+                if progress >= 4:
+                    self.active_sockets -= 1
+                if progress >= 3:
+                    self.requests -= 1
+                if progress >= 2:
+                    self.operation_count -= 1
+                if progress >= 1:
+                    self.conns.appendleft(conn)
+                raise
+
     def _get_conn(
         self, checkout_started_time: float, handler: Optional[_ClientCheckout] = None
     ) -> Connection:
@@ -1003,6 +1062,20 @@ class Pool:
             raise _PoolClosedError(
                 "Attempted to check out a connection from closed connection pool"
             )
+
+        try:
+            conn = self._checkout_idle()
+        except BaseException:
+            # _get_conn's own except clause emits this for every other failure;
+            # a checkOutStarted event must not be left unpaired.
+            self._telemetry.checkout_failed(
+                "An error occurred while trying to establish a new connection",
+                ConnectionCheckOutFailedReason.CONN_ERROR,
+                checkout_started_time,
+            )
+            raise
+        if conn is not None:
+            return conn
 
         with self.lock:
             self.operation_count += 1
@@ -1108,10 +1181,38 @@ class Pool:
         conn.pinned_txn = False
         conn.pinned_cursor = False
         self._pinned_sockets.discard(conn)
+        telemetry = self._telemetry
+        publishing = telemetry._should_publish or telemetry._should_log
+        if not publishing and self.pid == os.getpid() and not conn.closed:
+            # Returning a healthy connection to a ready pool takes the mutex
+            # once instead of three times; everything inside is bookkeeping,
+            # so no other holder can tell the difference. Every other outcome
+            # falls through to the long path, which closes a doomed socket
+            # BEFORE releasing the maxPoolSize slot -- releasing first would let
+            # another thread open a replacement while the old socket is open.
+            with self.size_cond:
+                if self.state == PoolState.READY and not self.stale_generation(
+                    conn.generation, conn.service_id
+                ):
+                    self.active_contexts.discard(conn.cancel_context)
+                    conn.update_last_checkin_time()
+                    conn.update_is_writable(bool(self.is_writable))
+                    self.conns.appendleft(conn)
+                    # Notify any threads waiting to create a connection.
+                    self._max_connecting_cond.notify()
+                    if txn:
+                        self.ntxns -= 1
+                    elif cursor:
+                        self.ncursors -= 1
+                    self.requests -= 1
+                    self.active_sockets -= 1
+                    self.operation_count -= 1
+                    self.size_cond.notify()
+                    return
+
         with self.lock:
             self.active_contexts.discard(conn.cancel_context)
-        telemetry = self._telemetry
-        if telemetry._should_publish or (telemetry._log and _is_debug_enabled(_CONNECTION_LOGGER)):
+        if publishing:
             telemetry.checked_in(conn.id)
         if self.pid != os.getpid():
             self.reset_without_pause()
@@ -1147,6 +1248,17 @@ class Pool:
             self.operation_count -= 1
             self.size_cond.notify()
 
+    def _needs_conn_closed_check(self, idle_time_seconds: float) -> bool:
+        """Whether _perished would have to ask the socket if it is still open.
+
+        _checkout_idle cannot make that call under the pool mutex and declines
+        instead.
+        """
+        check_interval_seconds = self._check_interval_seconds
+        return check_interval_seconds is not None and (
+            check_interval_seconds == 0 or idle_time_seconds > check_interval_seconds
+        )
+
     def _perished(self, conn: Connection) -> bool:
         """Return True and close the connection if it is "perished".
 
@@ -1170,10 +1282,10 @@ class Pool:
             conn.close_conn(ConnectionClosedReason.IDLE)
             return True
 
-        check_interval_seconds = self._check_interval_seconds
-        if check_interval_seconds is not None and (
-            check_interval_seconds == 0 or idle_time_seconds > check_interval_seconds
-        ):
+        # NOTE: _checkout_idle repeats every check below that it can make
+        # without touching the socket. A check added here has to be added there
+        # too, or the fast path will hand out connections this method discards.
+        if self._needs_conn_closed_check(idle_time_seconds):
             if conn.conn_closed():
                 conn.close_conn(ConnectionClosedReason.ERROR)
                 return True
@@ -1231,9 +1343,7 @@ class _PoolCheckout:
         pool = self._pool
         telemetry = pool._telemetry
         # Fast path: skip telemetry calls when CMAP events/logging are disabled
-        if not telemetry._should_publish and not (
-            telemetry._log and _is_debug_enabled(_CONNECTION_LOGGER)
-        ):
+        if not telemetry._should_publish and not telemetry._should_log:
             conn = pool._get_conn(time.monotonic(), handler=self._handler)
             self._conn = conn
             return conn
