@@ -47,7 +47,7 @@ from pymongo.errors import (
     OperationFailure,
 )
 from pymongo.helpers_shared import _check_write_command_response
-from pymongo.message import _UNICODE_REPLACE_CODEC_OPTIONS
+from pymongo.message import _UNICODE_REPLACE_CODEC_OPTIONS, _CursorAddress, _Query
 from pymongo.operations import (
     DeleteMany,
     DeleteOne,
@@ -84,7 +84,8 @@ from pymongo.synchronous.cursor import (
     Cursor,
     RawBatchCursor,
 )
-from pymongo.typings import _CollationIn, _DocumentType, _DocumentTypeArg, _Pipeline
+from pymongo.synchronous.cursor_base import _run_single_batch_find
+from pymongo.typings import _Address, _CollationIn, _DocumentType, _DocumentTypeArg, _Pipeline
 from pymongo.write_concern import DEFAULT_WRITE_CONCERN, WriteConcern, validate_boolean
 
 _IS_SYNC = True
@@ -92,6 +93,14 @@ _IS_SYNC = True
 T = TypeVar("T")
 
 _FIND_AND_MODIFY_DOC_FIELDS = {"value": 1}
+
+# find_one() calls whose kwargs fall inside this set need none of Cursor's
+# state. Widening it means handling the option in _find_one_single_batch, not
+# just adding the name: sort/hint/comment/max_time_ms/min/max/return_key/
+# show_record_id arrive via _query_spec()'s $query wrapping, and skip/collation/
+# batch_size/allow_disk_use/cursor_type/no_cursor_timeout are _Query arguments
+# pinned to their defaults here.
+_FIND_ONE_FAST_KWARGS = frozenset({"projection", "session"})
 
 
 _WriteOp = Union[
@@ -1744,10 +1753,106 @@ class Collection(common.BaseObject, Generic[_DocumentType]):
         """
         if filter is not None and not isinstance(filter, abc.Mapping):
             filter = {"_id": filter}
+        if (
+            # Positional form find(filter, projection) only: a second
+            # positional argument is skip. Duplicate projection falls through
+            # so Cursor raises its usual TypeError.
+            len(args) < 2
+            and _FIND_ONE_FAST_KWARGS.issuperset(kwargs)
+            and not (args and "projection" in kwargs)
+            # An overridden find() -- subclass or instance -- must be honoured.
+            and type(self).find is Collection.find
+            and "find" not in self.__dict__
+            # Load balancing pins cursors; the legacy $explain modifier makes
+            # the server reply with a plan instead of a cursor.
+            and not self._database.client._options.load_balanced
+            and (filter is None or "$explain" not in filter)
+        ):
+            return self._find_one_single_batch(
+                filter, args[0] if args else kwargs.get("projection"), kwargs.get("session")
+            )
         cursor = self.find(filter, *args, **kwargs)
         for result in cursor.limit(-1):
             return result
         return None
+
+    def _find_one_single_batch(
+        self,
+        filter: Optional[Mapping[str, Any]],
+        projection: Optional[Union[Mapping[str, Any], Iterable[str]]],
+        session: Optional[ClientSession],
+    ) -> Optional[_DocumentType]:
+        """Run find_one's query without building a Cursor.
+
+        A find with limit -1 sets singleBatch, so the server replies with cursor
+        id 0: no getMore, no killCursors, and none of the cursor state that
+        supports them is reachable.  Building and tearing that state down is the
+        largest single component of this call's client-side cost.
+        """
+        spec: Mapping[str, Any] = filter or {}
+        common.validate_is_mapping("filter", spec)
+        if projection is not None:
+            projection = helpers_shared._fields_list_to_dict(projection, "projection")
+        # As in Cursor._query_spec(): a filter whose first key is "query"
+        # must be wrapped or the server reads it as a modifier document.
+        if "query" in spec and (len(spec) == 1 or next(iter(spec)) == "query"):
+            spec = {"$query": spec}
+
+        client = self._database.client
+        if not session:
+            session = client._ensure_session()
+        else:
+            # As Cursor.__init__ does for an explicitly passed session.
+            session._attached_to_cursor = True
+        try:
+            # As Cursor._get_read_preference(): an implicit session does
+            # not contribute a read preference.
+            read_preference = self._read_preference_for(
+                session if session and not session._implicit else None
+            )
+            query = _Query(
+                0,  # flags
+                self._database.name,
+                self._name,
+                0,  # ntoskip
+                spec,
+                projection,
+                self.codec_options,
+                read_preference,
+                -1,  # limit: a negative limit sets singleBatch
+                0,  # batch_size
+                self.read_concern,
+                None,  # collation
+                session,
+                client,
+                None,  # allow_disk_use
+                False,  # exhaust
+            )
+
+            def _cmd(
+                _session: Optional[ClientSession],
+                _server: Server,
+                conn: Connection,
+                read_pref: _ServerMode,
+            ) -> tuple[Mapping[str, Any], _Address]:
+                query.reset()  # Reset the command in case of a retry.
+                return _run_single_batch_find(conn, query, read_pref)
+
+            cursor, address = client._retryable_read(_cmd, read_preference, session, "find")
+            cursor_id = cursor["id"]
+            if cursor_id:
+                # Unreachable against a server that honours singleBatch; a
+                # leaked cursor would be worse than a redundant killCursors.
+                ns = cursor.get("ns") or f"{self._database.name}.{self._name}"
+                client._close_cursor_now(cursor_id, _CursorAddress(address, ns), session=session)
+        finally:
+            # As the cursor teardown does for an implicit session.
+            if session and session._implicit:
+                session._attached_to_cursor = False
+                if not session._leave_alive:
+                    session._end_implicit_session()
+        first_batch = cursor["firstBatch"]
+        return first_batch[0] if first_batch else None
 
     def find(self, *args: Any, **kwargs: Any) -> Cursor[_DocumentType]:
         """Query the database.

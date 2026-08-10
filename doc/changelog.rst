@@ -6,6 +6,11 @@ Changes in Version 4.18.0 (2026/XX/XX)
 
 PyMongo 4.18 brings a number of changes including:
 
+- Improved :meth:`~pymongo.synchronous.collection.Collection.find_one` and
+  :meth:`~pymongo.asynchronous.collection.AsyncCollection.find_one` performance
+  by skipping cursor construction for calls that pass only a filter, a
+  projection and a session. The command sent and the command monitoring events
+  are unchanged.
 - Improved TLS connection performance by reusing TLS sessions across connections
   to the same server, avoiding a full handshake on each new connection.
   Session resumption is supported on all Python versions for synchronous clients

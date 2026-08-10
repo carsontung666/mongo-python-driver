@@ -31,6 +31,8 @@ from test.asynchronous.utils import async_get_pool, async_is_mongos
 
 sys.path[0:0] = [""]
 
+from unittest import mock
+
 from bson import encode
 from bson.codec_options import CodecOptions
 from bson.objectid import ObjectId
@@ -1766,6 +1768,330 @@ class AsyncTestCollection(AsyncIntegrationTest):
 
         self.assertEqual(1, (await db.test.find_one())["x"])
         self.assertEqual(2, (await db.test.find_one(skip=1, limit=2))["x"])
+
+    async def _find_one_commands(self, listener, call, keep_lsid=False):
+        """Run `call` and return the command documents it put on the wire."""
+        listener.reset()
+        await call()
+        cmds = [e.command for e in listener.started_events]
+        for cmd in cmds:
+            cmd.pop("$clusterTime", None)
+            if not keep_lsid:
+                cmd.pop("lsid", None)
+        return cmds
+
+    async def _fast_path_used(self, coll, call):
+        """Whether find_one served this call without building a cursor."""
+        used = []
+        cls = type(coll)
+        original = cls._find_one_single_batch
+
+        async def spy(self, *args, **kwargs):
+            used.append(True)
+            return await original(self, *args, **kwargs)
+
+        cls._find_one_single_batch = spy
+        try:
+            await call()
+        finally:
+            cls._find_one_single_batch = original
+        return bool(used)
+
+    async def _cursor_path(self, coll, **kwargs):
+        cursor = coll.find(kwargs.pop("filter", None), **kwargs)
+        async for _ in cursor.limit(-1):
+            return
+        return
+
+    async def test_find_one_fast_path_matches_cursor_path(self):
+        # find_one may skip building a cursor, but only if it sends exactly
+        # what the cursor path would have sent.
+        listener = OvertCommandListener()
+        client = await self.async_rs_or_single_client(event_listeners=[listener])
+        coll = client[self.db.name].test_find_one_fast
+        await coll.drop()
+        await coll.insert_one({"_id": 1, "hello": "world", "foo": "bar"})
+
+        for kwargs in (
+            {},
+            {"filter": {"_id": 1}},
+            {"filter": {"hello": "world"}, "projection": {"_id": 1}},
+            {"projection": ["hello"]},
+            {"projection": frozenset(["hello"])},
+            {"projection": {}},
+            {"filter": {"nomatch": 1}},
+            {"filter": {"query": 1, "hello": "world"}},
+            {"filter": {"hello": "world", "query": 1}},
+        ):
+            self.assertTrue(
+                await self._fast_path_used(coll, lambda k=kwargs: coll.find_one(**k)),
+                f"find_one(**{kwargs}) did not take the fast path",
+            )
+            fast = await self._find_one_commands(listener, lambda k=kwargs: coll.find_one(**k))
+            slow = await self._find_one_commands(
+                listener, lambda k=kwargs: self._cursor_path(coll, **k)
+            )
+            self.assertEqual(1, len(fast), "expected exactly one command")
+            self.assertEqual(
+                [list(c) for c in fast],
+                [list(c) for c in slow],
+                f"key order differs for find_one(**{kwargs})",
+            )
+            self.assertEqual(fast, slow, f"wire mismatch for find_one(**{kwargs})")
+
+        # The positional projection form takes the same path.
+        pos = await self._find_one_commands(
+            listener, lambda: coll.find_one({"_id": 1}, {"hello": 1})
+        )
+        kw = await self._find_one_commands(
+            listener, lambda: coll.find_one({"_id": 1}, projection={"hello": 1})
+        )
+        self.assertEqual(pos, kw)
+
+    async def test_find_one_fast_path_matches_cursor_path_with_session(self):
+        # The fast path re-implements session application and read preference
+        # resolution, so compare a session's own fields, lsid included.
+        listener = OvertCommandListener()
+        client = await self.async_rs_or_single_client(event_listeners=[listener])
+        coll = client[self.db.name].test_find_one_fast_session
+        await coll.drop()
+        await coll.insert_one({"_id": 1})
+
+        async with client.start_session(causal_consistency=True) as session:
+            # Prime the session so it carries an operation time to gossip.
+            await coll.find_one({"_id": 1}, session=session)
+            fast = await self._find_one_commands(
+                listener, lambda: coll.find_one({"_id": 1}, session=session), keep_lsid=True
+            )
+            slow = await self._find_one_commands(
+                listener,
+                lambda: self._cursor_path(coll, filter={"_id": 1}, session=session),
+                keep_lsid=True,
+            )
+            # afterClusterTime is advanced by each arm's own reply, and by any
+            # other writer on the cluster, so it cannot be compared between two
+            # calls -- assert it is carried, then drop it before comparing.
+            for cmds in (fast, slow):
+                self.assertIn("afterClusterTime", cmds[0]["readConcern"])
+                cmds[0]["readConcern"].pop("afterClusterTime")
+                if not cmds[0]["readConcern"]:
+                    cmds[0].pop("readConcern")
+            self.assertEqual([list(c) for c in fast], [list(c) for c in slow])
+            self.assertEqual(fast, slow)
+            self.assertIn("lsid", fast[0])
+
+    async def test_find_one_falls_back_for_other_options(self):
+        # Every find() option the fast path does not reproduce must still
+        # reach the server, which means falling back to the cursor path.
+        listener = OvertCommandListener()
+        client = await self.async_rs_or_single_client(event_listeners=[listener])
+        coll = client[self.db.name].test_find_one_fallback
+        await coll.drop()
+        await coll.insert_many([{"x": i} for i in range(1, 4)])
+        await coll.create_index([("x", 1)], name="x_1")
+
+        for kwargs, expected_key in (
+            ({"skip": 1}, "skip"),
+            ({"sort": [("x", -1)]}, "sort"),
+            ({"comment": "hi"}, "comment"),
+            ({"max_time_ms": 10000}, "maxTimeMS"),
+            ({"allow_disk_use": True}, "allowDiskUse"),
+            ({"collation": {"locale": "en_US"}}, "collation"),
+            ({"batch_size": 5}, "batchSize"),
+            ({"let": {"a": 1}}, "let"),
+            ({"return_key": True}, "returnKey"),
+            ({"show_record_id": True}, "showRecordId"),
+            ({"hint": "x_1"}, "hint"),
+        ):
+            self.assertFalse(
+                await self._fast_path_used(coll, lambda k=kwargs: coll.find_one({}, **k)),
+                f"find_one(**{kwargs}) took the fast path, which cannot carry it",
+            )
+            listener.reset()
+            await coll.find_one({}, **kwargs)
+            cmd = listener.started_events[0].command
+            self.assertIn(expected_key, cmd, f"find_one(**{kwargs}) dropped the option")
+
+        # A second positional argument is skip, not something the fast path takes.
+        self.assertFalse(await self._fast_path_used(coll, lambda: coll.find_one({}, None, 1)))
+        # The legacy $explain modifier makes the reply an explain document.
+        self.assertFalse(
+            await self._fast_path_used(
+                coll, lambda: coll.find_one({"$query": {"x": 1}, "$explain": True})
+            )
+        )
+        explained = await coll.find_one({"$query": {"x": 1}, "$explain": True})
+        self.assertIn("queryPlanner", explained)
+
+    async def test_find_one_falls_back_for_subclass_overriding_find(self):
+        # A subclass that overrides find() expects find_one to go through it.
+        calls = []
+
+        class RecordingCollection(AsyncCollection):
+            def find(self, *args, **kwargs):
+                calls.append(args)
+                return super().find(*args, **kwargs)
+
+        coll = RecordingCollection(self.db, "test_find_one_subclass")
+        await coll.drop()
+        await coll.insert_one({"_id": 1})
+        self.assertIsNotNone(await coll.find_one({"_id": 1}))
+        self.assertEqual(1, len(calls))
+
+    async def test_find_one_falls_back_for_instance_overriding_find(self):
+        # Patching find() on one instance is as much an override as
+        # subclassing, and mock.patch.object does exactly this.
+        coll = self.db.test_find_one_instance_override
+        await coll.drop()
+        await coll.insert_one({"_id": 1})
+        calls = []
+        original = coll.find
+
+        def recording(*args, **kwargs):
+            calls.append(args)
+            return original(*args, **kwargs)
+
+        coll.find = recording
+        try:
+            self.assertIsNotNone(await coll.find_one({"_id": 1}))
+        finally:
+            del coll.find
+        self.assertEqual(1, len(calls))
+
+    async def test_find_one_fast_path_survives_a_retry(self):
+        # The fast path calls _retryable_read directly and resets the query
+        # itself, so a retried read has to come back with the same document
+        # and the same command, twice -- and the retried call has to actually
+        # be the fast path, or this test guards nothing.
+        listener = OvertCommandListener()
+        client = await self.async_rs_or_single_client(event_listeners=[listener], retryReads=True)
+        coll = client[self.db.name].test_find_one_retry
+        await coll.drop()
+        await coll.insert_one({"_id": 1, "x": 1})
+        await coll.find_one({"_id": 1})
+
+        listener.reset()
+        used = []
+        original = AsyncCollection._find_one_single_batch
+
+        async def spy(target, *args, **kwargs):
+            used.append(True)
+            return await original(target, *args, **kwargs)
+
+        AsyncCollection._find_one_single_batch = spy
+        try:
+            async with self.fail_point(
+                {
+                    "mode": {"times": 1},
+                    "data": {"failCommands": ["find"], "closeConnection": True},
+                }
+            ):
+                self.assertEqual({"_id": 1, "x": 1}, await coll.find_one({"_id": 1}))
+        finally:
+            AsyncCollection._find_one_single_batch = original
+        self.assertTrue(used, "the retried read did not take the fast path")
+        finds = [e for e in listener.started_events if e.command_name == "find"]
+        self.assertEqual(2, len(finds), "expected one failure and one retry")
+        # The reconnect after closeConnection gossips a fresh $clusterTime, and
+        # any write on the deployment advances it, so it cannot be compared
+        # between the two attempts.
+        for e in finds:
+            e.command.pop("$clusterTime", None)
+        self.assertEqual(finds[0].command, finds[1].command)
+
+    async def test_find_one_kills_an_unexpected_nonzero_cursor_id(self):
+        # No server that honours singleBatch can take this branch, so it is
+        # pinned by faking the reply: a nonzero cursor id must be killed, not
+        # leaked.
+        listener = OvertCommandListener()
+        client = await self.async_rs_or_single_client(event_listeners=[listener])
+        coll = client[self.db.name].test_find_one_killcursors
+        await coll.drop()
+        await coll.insert_one({"_id": 1})
+        from pymongo.asynchronous import collection as collection_mod
+
+        original = collection_mod._run_single_batch_find
+
+        async def nonzero_id(conn, operation, read_preference):
+            cursor, address = await original(conn, operation, read_preference)
+            forged = dict(cursor)
+            forged["id"] = 123456
+            return forged, address
+
+        collection_mod._run_single_batch_find = nonzero_id
+        try:
+            listener.reset()
+            self.assertEqual({"_id": 1}, await coll.find_one({"_id": 1}))
+        finally:
+            collection_mod._run_single_batch_find = original
+        kills = [e for e in listener.started_events if e.command_name == "killCursors"]
+        self.assertEqual(1, len(kills), "the forged cursor id was not killed")
+        self.assertEqual([123456], kills[0].command["cursors"])
+
+    async def test_find_one_falls_back_when_load_balanced(self):
+        # Load balancing pins cursors; the fast path never creates one.
+        client = await self.async_rs_or_single_client()
+        coll = client[self.db.name].test_find_one_lb
+        await coll.drop()
+        await coll.insert_one({"_id": 1})
+        with mock.patch.object(type(client.options), "load_balanced", True):
+            self.assertFalse(await self._fast_path_used(coll, lambda: coll.find_one({"_id": 1})))
+
+    async def test_find_one_filter_named_query_is_wrapped(self):
+        # A filter whose first key is "query" has to be wrapped or the server
+        # reads it as a modifier document. Both paths must agree.
+        listener = OvertCommandListener()
+        client = await self.async_rs_or_single_client(event_listeners=[listener])
+        coll = client[self.db.name].test_find_one_query_key
+        await coll.drop()
+        await coll.insert_one({"query": {"a": 1}})
+
+        listener.reset()
+        fast = await coll.find_one({"query": {"a": 1}})
+        fast_cmd = listener.started_events[0].command["filter"]
+
+        listener.reset()
+        cursor = coll.find({"query": {"a": 1}})
+        slow = None
+        async for doc in cursor.limit(-1):
+            slow = doc
+        slow_cmd = listener.started_events[0].command["filter"]
+
+        self.assertEqual(fast_cmd, slow_cmd)
+        self.assertEqual(fast, slow)
+        self.assertIsNotNone(fast)
+
+    async def test_find_one_returns_implicit_session(self):
+        # The implicit session find_one borrows has to go back to the pool, or
+        # every call leaks a server session.
+        client = await self.async_rs_or_single_client()
+        coll = client[self.db.name].test_find_one_session
+        await coll.drop()
+        await coll.insert_one({"_id": 1})
+
+        await coll.find_one({"_id": 1})
+        pool_size = len(client._topology._session_pool)
+        for _ in range(5):
+            await coll.find_one({"_id": 1})
+        self.assertEqual(pool_size, len(client._topology._session_pool))
+
+    async def test_find_one_explicit_session_is_not_ended(self):
+        client = await self.async_rs_or_single_client()
+        coll = client[self.db.name].test_find_one_explicit_session
+        await coll.drop()
+        await coll.insert_one({"_id": 1})
+
+        async with client.start_session() as session:
+            self.assertIsNotNone(await coll.find_one({"_id": 1}, session=session))
+            # Still usable: find_one must not have ended a session it borrowed
+            # from the caller.
+            self.assertIsNotNone(await coll.find_one({"_id": 1}, session=session))
+
+    async def test_find_one_rejects_duplicate_projection(self):
+        coll = self.db.test_find_one_dupe
+        with self.assertRaises(TypeError) as ctx:
+            await coll.find_one({"_id": 1}, {"a": 1}, projection={"a": 1})
+        self.assertIn("projection", str(ctx.exception))
 
     async def test_find_with_sort(self):
         db = self.db

@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from pymongo.asynchronous.client_session import AsyncClientSession
     from pymongo.asynchronous.pool import AsyncConnection
     from pymongo.read_preferences import _ServerMode
+    from pymongo.typings import _Address
 
 _IS_SYNC = False
 
@@ -49,6 +50,42 @@ async def _operation_to_command(
         )
     operation.update_command(cmd)
     return cmd, db
+
+
+@_handle_reauth
+async def _run_single_batch_find(
+    conn: AsyncConnection,
+    operation: _Query,
+    read_preference: _ServerMode,
+) -> tuple[Mapping[str, Any], _Address]:
+    """Run a singleBatch find and return its cursor subdocument and address.
+
+    The cursor equivalent is :meth:`_AsyncCursorBase._run_with_conn`; a
+    singleBatch reply cannot carry a live cursor, so there is nothing to pin
+    and no need for a Response wrapper.
+    """
+    use_cmd = operation.use_command(conn)
+    cmd, dbn = await _operation_to_command(operation, conn, use_cmd)
+    request_id, data, max_doc_size = _split_message(
+        operation.get_message(read_preference, conn, use_cmd)
+    )
+    client = operation.client
+    docs, _reply, _duration = await run_cursor_command(
+        conn,
+        cmd,
+        dbn,
+        request_id,
+        data,
+        client=client,  # type: ignore[arg-type]
+        session=operation.session,  # type: ignore[arg-type]
+        listeners=client._event_listeners,
+        codec_options=operation.codec_options,
+        user_fields=_CURSOR_DOC_FIELDS,
+        command_name=operation.name,
+        pool_opts=conn.opts,
+        max_doc_size=max_doc_size,
+    )
+    return docs[0]["cursor"], conn.address
 
 
 class _ConnectionManager:
