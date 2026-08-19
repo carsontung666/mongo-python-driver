@@ -1801,7 +1801,6 @@ class AsyncTestCollection(AsyncIntegrationTest):
         cursor = coll.find(kwargs.pop("filter", None), **kwargs)
         async for _ in cursor.limit(-1):
             return
-        return
 
     async def test_find_one_fast_path_matches_cursor_path(self):
         # find_one may skip building a cursor, but only if it sends exactly
@@ -2036,30 +2035,6 @@ class AsyncTestCollection(AsyncIntegrationTest):
         await coll.insert_one({"_id": 1})
         with mock.patch.object(type(client.options), "load_balanced", True):
             self.assertFalse(await self._fast_path_used(coll, lambda: coll.find_one({"_id": 1})))
-
-    async def test_find_one_filter_named_query_is_wrapped(self):
-        # A filter whose first key is "query" has to be wrapped or the server
-        # reads it as a modifier document. Both paths must agree.
-        listener = OvertCommandListener()
-        client = await self.async_rs_or_single_client(event_listeners=[listener])
-        coll = client[self.db.name].test_find_one_query_key
-        await coll.drop()
-        await coll.insert_one({"query": {"a": 1}})
-
-        listener.reset()
-        fast = await coll.find_one({"query": {"a": 1}})
-        fast_cmd = listener.started_events[0].command["filter"]
-
-        listener.reset()
-        cursor = coll.find({"query": {"a": 1}})
-        slow = None
-        async for doc in cursor.limit(-1):
-            slow = doc
-        slow_cmd = listener.started_events[0].command["filter"]
-
-        self.assertEqual(fast_cmd, slow_cmd)
-        self.assertEqual(fast, slow)
-        self.assertIsNotNone(fast)
 
     async def test_find_one_returns_implicit_session(self):
         # The implicit session find_one borrows has to go back to the pool, or

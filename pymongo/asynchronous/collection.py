@@ -94,12 +94,7 @@ T = TypeVar("T")
 
 _FIND_AND_MODIFY_DOC_FIELDS = {"value": 1}
 
-# find_one() calls whose kwargs fall inside this set need none of AsyncCursor's
-# state. Widening it means handling the option in _find_one_single_batch, not
-# just adding the name: sort/hint/comment/max_time_ms/min/max/return_key/
-# show_record_id arrive via _query_spec()'s $query wrapping, and skip/collation/
-# batch_size/allow_disk_use/cursor_type/no_cursor_timeout are _Query arguments
-# pinned to their defaults here.
+# Kwargs this path implements. Anything else falls through to find().
 _FIND_ONE_FAST_KWARGS = frozenset({"projection", "session"})
 
 
@@ -1754,17 +1749,12 @@ class AsyncCollection(common.BaseObject, Generic[_DocumentType]):
         if filter is not None and not isinstance(filter, abc.Mapping):
             filter = {"_id": filter}
         if (
-            # Positional form find(filter, projection) only: a second
-            # positional argument is skip. Duplicate projection falls through
-            # so AsyncCursor raises its usual TypeError.
+            # args[1] is skip; a duplicate projection must raise from find().
             len(args) < 2
             and _FIND_ONE_FAST_KWARGS.issuperset(kwargs)
             and not (args and "projection" in kwargs)
-            # An overridden find() -- subclass or instance -- must be honoured.
             and type(self).find is AsyncCollection.find
             and "find" not in self.__dict__
-            # Load balancing pins cursors; the legacy $explain modifier makes
-            # the server reply with a plan instead of a cursor.
             and not self._database.client._options.load_balanced
             and (filter is None or "$explain" not in filter)
         ):
@@ -1782,19 +1772,11 @@ class AsyncCollection(common.BaseObject, Generic[_DocumentType]):
         projection: Optional[Union[Mapping[str, Any], Iterable[str]]],
         session: Optional[AsyncClientSession],
     ) -> Optional[_DocumentType]:
-        """Run find_one's query without building an AsyncCursor.
-
-        A find with limit -1 sets singleBatch, so the server replies with cursor
-        id 0: no getMore, no killCursors, and none of the cursor state that
-        supports them is reachable.  Building and tearing that state down is the
-        largest single component of this call's client-side cost.
-        """
+        """Run find_one without constructing a cursor."""
         spec: Mapping[str, Any] = filter or {}
         common.validate_is_mapping("filter", spec)
         if projection is not None:
             projection = helpers_shared._fields_list_to_dict(projection, "projection")
-        # As in AsyncCursor._query_spec(): a filter whose first key is "query"
-        # must be wrapped or the server reads it as a modifier document.
         if "query" in spec and (len(spec) == 1 or next(iter(spec)) == "query"):
             spec = {"$query": spec}
 
@@ -1802,11 +1784,8 @@ class AsyncCollection(common.BaseObject, Generic[_DocumentType]):
         if not session:
             session = client._ensure_session()
         else:
-            # As AsyncCursor.__init__ does for an explicitly passed session.
             session._attached_to_cursor = True
         try:
-            # As AsyncCursor._get_read_preference(): an implicit session does
-            # not contribute a read preference.
             read_preference = self._read_preference_for(
                 session if session and not session._implicit else None
             )
@@ -1841,14 +1820,12 @@ class AsyncCollection(common.BaseObject, Generic[_DocumentType]):
             cursor, address = await client._retryable_read(_cmd, read_preference, session, "find")
             cursor_id = cursor["id"]
             if cursor_id:
-                # Unreachable against a server that honours singleBatch; a
-                # leaked cursor would be worse than a redundant killCursors.
+                # singleBatch replies have id 0; kill rather than leak if not.
                 ns = cursor.get("ns") or f"{self._database.name}.{self._name}"
                 await client._close_cursor_now(
                     cursor_id, _CursorAddress(address, ns), session=session
                 )
         finally:
-            # As the cursor teardown does for an implicit session.
             if session and session._implicit:
                 session._attached_to_cursor = False
                 if not session._leave_alive:

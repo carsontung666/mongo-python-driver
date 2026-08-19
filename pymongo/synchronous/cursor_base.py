@@ -58,12 +58,7 @@ def _run_single_batch_find(
     operation: _Query,
     read_preference: _ServerMode,
 ) -> tuple[Mapping[str, Any], _Address]:
-    """Run a singleBatch find and return its cursor subdocument and address.
-
-    The cursor equivalent is :meth:`_CursorBase._run_with_conn`; a
-    singleBatch reply cannot carry a live cursor, so there is nothing to pin
-    and no need for a Response wrapper.
-    """
+    """Run a singleBatch find; return the cursor subdocument and address."""
     use_cmd = operation.use_command(conn)
     cmd, dbn = _operation_to_command(operation, conn, use_cmd)
     request_id, data, max_doc_size = _split_message(
